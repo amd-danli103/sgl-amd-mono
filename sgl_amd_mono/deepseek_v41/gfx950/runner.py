@@ -330,7 +330,8 @@ class DSV41MonoRunner:
         if dev.index is None:
             dev = torch.device(dev.type, torch.cuda.current_device())
         self.device = dev
-        self._scratch: dict[int, torch.Tensor] = {}
+        self._group = group
+        self._scratch: dict[int, PeerBuffer] = {}
         # [epoch, the guard block (deadline, error words), a mark per CTA, the MoE's counters]
         self.epoch = torch.zeros(EPOCH_WORDS, dtype=torch.int32, device=dev)
         self.fault_site, self.fault_after = guard.fault_injection(rank) or (0, 0)
@@ -395,19 +396,31 @@ class DSV41MonoRunner:
         self.epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
 
     def scratch(self, tokens: int) -> torch.Tensor:
-        """Return this width's scratch, allocated before graph capture."""
+        """Return this width's scratch, allocated before graph capture.
+
+        Uncached, as the peer buffer is: a hand-off's line is read at its home memory,
+        not through the producer XCD's L2."""
         buf = self._scratch.get(tokens)
         if buf is None:
+            from sgl_amd_mono.common.peer import PeerBuffer
+
             no_capture(f"step width {tokens}")
-            buf = torch.zeros(
-                scratch_bytes(
-                    tokens, self.tp, self.timeline_on, **self.route_at(tokens)
-                ),
-                dtype=torch.uint8,
-                device=self.device,
-            )
+            # hipExtMallocWithFlags takes the current device, and the hipMemset after it
+            # is only queued on the null stream, which a non-blocking stream doesn't
+            # wait for: a launch expects its scratch zeroed
+            with torch.cuda.device(self.device):
+                buf = PeerBuffer(
+                    scratch_bytes(
+                        tokens, self.tp, self.timeline_on, **self.route_at(tokens)
+                    ),
+                    self._group,
+                    self.rank,
+                    1,
+                    self.device,
+                )
+                torch.cuda.synchronize()
             self._scratch[tokens] = buf
-        return buf
+        return buf.bytes
 
     def route_at(self, tokens: int) -> dict:
         """The route every launch and the scratch of this width share.
