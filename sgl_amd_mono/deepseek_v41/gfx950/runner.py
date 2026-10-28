@@ -32,6 +32,7 @@ from .layer import (
     scratch_layout,
 )
 from .stages.dims import Dims as MoeDims
+from .stages.gemv import token_tiles
 from .stages.moe_shape import EXPERTS
 from .stages.moe_shape import TOPK as ROUTE_TOPK
 from .token_par import token_par
@@ -52,6 +53,24 @@ RECORD = DATA + 8  # a token's KV record: 576 B of data, then 8 B of scales
 _LOG2E = 1.4426950408889634
 # a wait's deadline until the framework sets one from its watchdog timeout
 DEFAULT_DEADLINE_S = 60.0
+
+
+def down_ahead_at(s: int, tp: int) -> bool:
+    """Whether an s-row step's MoE down stage loads a round ahead.
+
+    Two rounds of weights stay live then. At TP2 (an intermediate width of 1152 a rank)
+    they don't fit the 256 VGPRs a wave of a 512-thread CTA gets, and K2 spills; at TP4
+    the load-ahead pays from 12 rows."""
+    return tp == 4 and s >= 12
+
+
+def ug_all_at(s: int, tp: int) -> bool:
+    """Whether every CTA takes ug tasks in a one-tile step, the shared expert's too.
+
+    Those CTAs reach the ug stage late: a row or two route to too few experts for it to
+    pay, and at TP4 it gains nothing at 6 rows and spills more VGPRs at 12. Only a
+    one-tile step reads it (``ug_free``), so a wider one keeps the default key."""
+    return tp == 2 and s >= 3 and len(token_tiles(s)) == 1
 
 
 def compile_only(launch) -> None:
@@ -281,6 +300,8 @@ class DSV41MonoRunner:
         ug_groups: int | None = None,
         swa_width: int = WINDOW,
         shuffled: bool = False,
+        down_ahead: bool | None = None,
+        ug_all: bool | None = None,
     ):
         _ensure_writable_flydsl_cache()
         from sgl_amd_mono.common.peer import PeerBuffer
@@ -293,6 +314,13 @@ class DSV41MonoRunner:
                 f"width), got {ug_groups}"
             )
         self.ug_groups = ug_groups
+        for name, v in (("down_ahead", down_ahead), ("ug_all", ug_all)):
+            if v is not None and not isinstance(v, bool):
+                raise ValueError(
+                    f"{name} is true or false (None: by TP and width), got {v!r}"
+                )
+        # None: by TP and width (``moe_knobs``)
+        self.down_ahead, self.ug_all = down_ahead, ug_all
         self.timeline_on = os.environ.get("SGLANG_AMD_MONO_TIMELINE") == "1"
         self.token_par_on = os.environ.get("SGLANG_AMD_MONO_TOKEN_PAR", "1") == "1"
         # K1 / K2 read wqkv, wq_b and wo_b in aiter's (16, 16) preshuffle
@@ -391,6 +419,15 @@ class DSV41MonoRunner:
             ug = 1 if tokens < FINE_UG_ROWS else 2
         return {**self.route, "ug_groups": ug}
 
+    def moe_knobs(self, tokens: int) -> dict:
+        """The MoE's down load-ahead and one-tile ug placement at this width
+        (``down_ahead_at`` / ``ug_all_at``), where the runner does not fix them."""
+        da, ua = self.down_ahead, self.ug_all
+        return {
+            "down_ahead": down_ahead_at(tokens, self.tp) if da is None else da,
+            "ug_all": ug_all_at(tokens, self.tp) if ua is None else ua,
+        }
+
     def timeline(self, tokens: int) -> torch.Tensor:
         """The last launch's stage marks at this width: int64 [BLOCKS, TL_POINTS],
         100 MHz ticks (SGLANG_AMD_MONO_TIMELINE=1 builds only)."""
@@ -485,6 +522,7 @@ class DSV41MonoRunner:
                     fault_after=self.fault_after,
                     timeline=self.timeline_on,
                     **self.route_at(tokens),
+                    **self.moe_knobs(tokens),
                 )
             )
         return self._kernels[key]
@@ -508,6 +546,7 @@ class DSV41MonoRunner:
                     timeline=self.timeline_on,
                     tok_par=tok_par,
                     **self.route_at(tokens),
+                    **self.moe_knobs(tokens),
                 )
             )
         return self._kernels[key]
