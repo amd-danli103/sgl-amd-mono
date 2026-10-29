@@ -73,6 +73,15 @@ def ug_all_at(s: int, tp: int) -> bool:
     return tp == 2 and s >= 3 and len(token_tiles(s)) == 1
 
 
+def token_par_at(s: int, tp: int) -> bool:
+    """Whether an s-row step runs token parallel (``token_par``).
+
+    At TP2 a rank keeps half the rows, too few to pay for the gathers' extra hop: from
+    12 rows a decode step is 2-4% slower with it, and AgentX TP2 c16's ITL is 2.97 ms
+    against 2.85 without. At TP4 K2 is level at 12 rows and about 5% faster from 24."""
+    return tp >= 4 and token_par(s, tp)
+
+
 def compile_only(launch) -> None:
     """Build the launcher without dispatching its kernels."""
     import inspect
@@ -455,8 +464,8 @@ class DSV41MonoRunner:
         )
 
     def tok_par(self, tokens: int) -> bool:
-        """Whether a target step of this width runs token parallel (``token_par``)."""
-        return self.token_par_on and token_par(tokens, self.tp)
+        """Whether a target step of this width runs token parallel (``token_par_at``)."""
+        return self.token_par_on and token_par_at(tokens, self.tp)
 
     @staticmethod
     def supports(tokens: int) -> bool:
