@@ -32,6 +32,7 @@ from .layer import (
     scratch_layout,
 )
 from .stages.dims import Dims as MoeDims
+from .stages.gemv import token_tiles
 from .stages.moe_shape import EXPERTS
 from .stages.moe_shape import TOPK as ROUTE_TOPK
 from .token_par import token_par
@@ -48,10 +49,23 @@ __all__ = [
 HC = 4
 # below this many rows an ug task takes one FP4 group (``route_at``)
 FINE_UG_ROWS = 7
+# from this many rows, by TP, a one-tile step's ug goes on every CTA (``ug_all_at``)
+UG_ALL_ROWS = {2: 3, 4: 8}
 RECORD = DATA + 8  # a token's KV record: 576 B of data, then 8 B of scales
 _LOG2E = 1.4426950408889634
 # a wait's deadline until the framework sets one from its watchdog timeout
 DEFAULT_DEADLINE_S = 60.0
+
+
+def ug_all_at(s: int, tp: int) -> bool:
+    """Whether every CTA takes ug tasks in a one-tile step, the shared expert's too.
+
+    Those CTAs reach the ug stage late, which pays only once the rows route to enough
+    experts: from 3 rows at TP2 and 8 at TP4, timing K1 + K2 a layer with token parallel
+    where the runner puts it. Only a one-tile step reads it (``ug_free``), so a wider
+    one keeps the default key."""
+    first = UG_ALL_ROWS.get(tp)
+    return first is not None and s >= first and len(token_tiles(s)) == 1
 
 
 def compile_only(launch) -> None:
@@ -281,6 +295,7 @@ class DSV41MonoRunner:
         ug_groups: int | None = None,
         swa_width: int = WINDOW,
         shuffled: bool = False,
+        ug_all: bool | None = None,
     ):
         _ensure_writable_flydsl_cache()
         from sgl_amd_mono.common.peer import PeerBuffer
@@ -293,6 +308,12 @@ class DSV41MonoRunner:
                 f"width), got {ug_groups}"
             )
         self.ug_groups = ug_groups
+        if ug_all is not None and not isinstance(ug_all, bool):
+            raise ValueError(
+                f"ug_all is true or false (None: by TP and width), got {ug_all!r}"
+            )
+        # None: by TP and width (``moe_knobs``)
+        self.ug_all = ug_all
         self.timeline_on = os.environ.get("SGLANG_AMD_MONO_TIMELINE") == "1"
         self.token_par_on = os.environ.get("SGLANG_AMD_MONO_TOKEN_PAR", "1") == "1"
         # K1 / K2 read wqkv, wq_b and wo_b in aiter's (16, 16) preshuffle
@@ -391,6 +412,12 @@ class DSV41MonoRunner:
             ug = 1 if tokens < FINE_UG_ROWS else 2
         return {**self.route, "ug_groups": ug}
 
+    def moe_knobs(self, tokens: int) -> dict:
+        """The MoE's one-tile ug placement at this width (``ug_all_at``), where the
+        runner does not fix it."""
+        ua = self.ug_all
+        return {"ug_all": ug_all_at(tokens, self.tp) if ua is None else ua}
+
     def timeline(self, tokens: int) -> torch.Tensor:
         """The last launch's stage marks at this width: int64 [BLOCKS, TL_POINTS],
         100 MHz ticks (SGLANG_AMD_MONO_TIMELINE=1 builds only)."""
@@ -485,6 +512,7 @@ class DSV41MonoRunner:
                     fault_after=self.fault_after,
                     timeline=self.timeline_on,
                     **self.route_at(tokens),
+                    **self.moe_knobs(tokens),
                 )
             )
         return self._kernels[key]
@@ -508,6 +536,7 @@ class DSV41MonoRunner:
                     timeline=self.timeline_on,
                     tok_par=tok_par,
                     **self.route_at(tokens),
+                    **self.moe_knobs(tokens),
                 )
             )
         return self._kernels[key]
