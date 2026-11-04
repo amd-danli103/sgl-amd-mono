@@ -81,13 +81,16 @@ class NoOccupancy(RuntimeError):
     """FlyDSL cannot give a kernel's occupancy (``strict``)."""
 
 
-_FAILURES = {e.__name__: e for e in (Unreadable, NotResident, OverBudget, NoOccupancy)}
+_FAILURES = {
+    e.__name__: e
+    for e in (Unreadable, NotResident, OverBudget, NoOccupancy, ValueError, TypeError)
+}
 
 
 class Resources(msgspec.Struct, frozen=True):
     """One binary's metadata; a field its code object lacks is None."""
 
-    name: str  # the ``kernel_symbol`` stem
+    name: str  # the last nested name (``kernel_symbol``'s ``<stem>_<params>``)
     symbol: str  # as the code object names it
     vgpr: int
     agpr: Optional[int]
@@ -223,7 +226,8 @@ def _stem(symbol: str) -> str:
 
 def resident_per_cu(artifact) -> int:
     """The workgroups of ``artifact``'s kernel a CU holds at once, as FlyDSL asks HIP
-    (its launch's block size and dynamic LDS): 0 for none or a failed query alike."""
+    (its launch's block size and dynamic LDS): 0 for none or a failed query alike,
+    which FlyDSL reports the same way; ``NoOccupancy`` when it cannot ask at all."""
     query = getattr(artifact, "max_blocks_per_cu", None)
     if query is None:
         raise NoOccupancy("this FlyDSL has no max_blocks_per_cu()")

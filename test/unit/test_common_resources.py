@@ -10,6 +10,7 @@ kernel (compile-only, no GPU needed) and reads it.
 
 import inspect
 import logging
+import queue
 import struct
 import time
 from types import SimpleNamespace
@@ -99,8 +100,12 @@ def fresh(monkeypatch):
     monkeypatch.delenv("SGLANG_AMD_MONO_RESOURCES", raising=False)
 
 
+def _records(caplog) -> list:
+    return [r for r in caplog.records if r.name == resources.__name__]
+
+
 def _warnings(caplog) -> list[str]:
-    return [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    return [r.getMessage() for r in _records(caplog) if r.levelname == "WARNING"]
 
 
 def test_read_a_launchers_code_object():
@@ -173,16 +178,16 @@ def test_within_the_budget_logs_only_when_reporting(monkeypatch, caplog):
     caplog.set_level(logging.INFO, logger=resources.__name__)
     within = _launcher(_elf(scratch=0, vgpr_spill=0))
     resources.check(within)
-    assert caplog.records == []
+    assert _records(caplog) == []
     monkeypatch.setenv("SGLANG_AMD_MONO_RESOURCES", "report")
     resources.check(within)
-    assert [r.levelname for r in caplog.records] == ["INFO"]
+    assert [r.levelname for r in _records(caplog)] == ["INFO"]
 
 
 def test_a_repeated_build_logs_nothing(caplog):
     caplog.set_level(logging.INFO, logger=resources.__name__)
     assert len(resources.check(_launcher(_elf()), log=False)) == 1
-    assert caplog.records == []
+    assert _records(caplog) == []
 
 
 def test_a_code_object_seen_before_is_returned_and_not_logged_again(caplog):
@@ -227,7 +232,7 @@ def test_one_workgroup_a_cu_holds_the_grid_asked_once(monkeypatch, caplog):
     resources.check(launcher)
     resources.check(launcher)
     assert asked == [1]
-    (rec,) = caplog.records
+    (rec,) = _records(caplog)
     assert rec.getMessage().endswith("1 resident a CU")
 
 
@@ -286,10 +291,11 @@ def test_an_unknown_mode_is_refused(monkeypatch):
         resources.check(_launcher(_elf()))
 
 
-def test_a_long_symbol_that_is_not_nested_reads_fast():
-    # 24 digit runs and no closing E: a backtracking regex over the nested name is
-    # exponential in its digit runs
-    symbol = "_ZN5aiter8kernel_a" + "_x1" * 22 + "Ev"
+@pytest.mark.parametrize("tail", ["Ev", "E"])
+def test_a_long_symbol_that_is_not_nested_reads_fast(tail):
+    # 24 digit runs, not a nested name (no closing E, or a part with no length
+    # prefix): a backtracking regex over it is exponential in its digit runs
+    symbol = "_ZN5aiter8kernel_a" + "_x1" * 22 + tail
     t0 = time.perf_counter()
     r = resources.read(_elf(symbol=symbol))
     assert time.perf_counter() - t0 < 1.0
@@ -333,9 +339,15 @@ def test_ranks_that_all_pass_return_their_readings(monkeypatch):
             resources.OverBudget,
             r"^rank 1: a \(and 1 more ranks\)$",
         ),
+        ([("ValueError", "a")], ValueError, r"^rank 1: a$"),
         ([("KeyError", "'ir'")], RuntimeError, r"^rank 1: KeyError: 'ir'$"),
     ],
-    ids=["a peer fails", "the lowest of two, the other counted", "any error by name"],
+    ids=[
+        "a peer fails",
+        "the lowest of two, the other counted",
+        "a ValueError keeps its type",
+        "any other error by name",
+    ],
 )
 def test_a_peers_failure_raises_on_this_rank(monkeypatch, peers, raised, match):
     _ranks(monkeypatch, *peers)
@@ -354,11 +366,22 @@ def test_this_ranks_failure_is_sent_and_raised(monkeypatch):
     assert isinstance(err.value.__cause__, resources.OverBudget)
 
 
+def test_a_mistyped_mode_raises_a_value_error_with_a_group_too(monkeypatch):
+    monkeypatch.setenv("SGLANG_AMD_MONO_RESOURCES", "loud")
+    _ranks(monkeypatch, None)
+    with pytest.raises(ValueError, match="^rank 0: .*loud"):
+        resources.check(_launcher(_elf()), group="tp")
+
+
 def _rank_main(rank: int, init: str, out) -> None:
     """One of two gloo ranks: rank 1's kernel cannot be resident, rank 0's can."""
+    from datetime import timedelta
+
     import torch.distributed as dist
 
-    dist.init_process_group("gloo", init_method=init, rank=rank, world_size=2)
+    dist.init_process_group(
+        "gloo", init_method=init, rank=rank, world_size=2, timeout=timedelta(seconds=60)
+    )
     resources._compute_units = lambda: 256
     blocks = (lambda: 0) if rank == 1 else (lambda: 1)
     try:
@@ -384,14 +407,19 @@ def test_two_gloo_ranks_raise_together(tmp_path):
     procs = [ctx.Process(target=_rank_main, args=(r, init, out)) for r in (0, 1)]
     for p in procs:
         p.start()
+    got = {}
     try:
-        got = dict(out.get(timeout=120) for _ in procs)
+        for _ in procs:
+            rank, seen = out.get(timeout=120)
+            got[rank] = seen
+    except queue.Empty:
+        pass
     finally:
         for p in procs:
             p.join(timeout=30)
             if p.is_alive():
                 p.kill()
-    assert got.keys() == {0, 1}
+    assert got.keys() == {0, 1}, f"got {got}, exit codes {[p.exitcode for p in procs]}"
     for rank in (0, 1):
         assert got[rank].startswith("NotResident: rank 1: "), got
         assert "(or HIP could not answer)" in got[rank]
